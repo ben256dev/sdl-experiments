@@ -11,6 +11,5 @@ cmake -S . -B build
 Build and run
 
 ```bash
-cmake --build build -j
-./build/sdl3_gpu_triangle
+cmake --build build -j && ./build/sdlgpu_imgui_triangle
 ```
