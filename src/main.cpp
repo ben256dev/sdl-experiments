@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <cstdarg>
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -233,7 +234,7 @@ static void destroy_pipeline(SDL_GPUDevice* device, GpuPipeline* gp) {
 int main(int, char**) {
     if (!SDL_Init(SDL_INIT_VIDEO)) return 1;
 
-    SDL_Window* window = SDL_CreateWindow("SDL3 GPU + ImGui (hot reload)", 1280, 720, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    SDL_Window* window = SDL_CreateWindow("SDL3 GPU + ImGui (docking + hot reload)", 1280, 720, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) return 1;
 
     SDL_GPUDevice* device = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV, false, NULL);
@@ -297,6 +298,8 @@ int main(int, char**) {
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     ImGui_ImplSDL3_InitForSDLGPU(window);
     ImGui_ImplSDLGPU3_InitInfo ii;
     SDL_zero(ii);
@@ -364,6 +367,7 @@ int main(int, char**) {
         ImGui_ImplSDLGPU3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
+        ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
         ImGui::Begin("Reload Log");
         if (ImGui::Button("Clear")) g_log.clear();
         ImGui::SameLine();
