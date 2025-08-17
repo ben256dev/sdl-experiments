@@ -1,10 +1,7 @@
 #version 450
-layout(location=0) in vec2 v_uv;
-layout(location=1) in vec4 v_color;
-layout(location=0) out vec4 out_color;
-layout(set=2, binding=0) uniform sampler2D uTex0;
+layout(location = 0) in vec3 v_col;
+layout(location = 0) out vec4 out_col;
 void main() {
-    vec4 t = texture(uTex0, v_uv);
-    out_color = v_color * t;
+    out_col = vec4(v_col, 1.0);
 }
 
