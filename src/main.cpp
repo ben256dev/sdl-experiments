@@ -76,8 +76,29 @@ namespace brender {
         SDL_Window*           window_ptr;
         SDL_GPUDevice*        device_ptr;
         SDL_GPUTextureFormat  swap_format;
+        SDL_GPUTexture*       msaa_color;
+        SDL_GPUSampleCount    msaa;
         brender::frame        frame;
     };
+
+    static void recreate_msaa_color(brender::renderer& render)
+    {
+        int pxw = 0, pxh = 0;
+        SDL_GetWindowSizeInPixels(render.window_ptr, &pxw, &pxh);
+        if (render.msaa_color) SDL_ReleaseGPUTexture(render.device_ptr, render.msaa_color);
+        SDL_GPUTextureCreateInfo ci{};
+        ci.type = SDL_GPU_TEXTURETYPE_2D;
+        ci.format = render.swap_format;
+        ci.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
+        ci.width = (Uint32)pxw;
+        ci.height = (Uint32)pxh;
+        ci.layer_count_or_depth = 1;
+        ci.num_levels = 1;
+        ci.sample_count = render.msaa;
+        ci.props = 0;
+        render.msaa_color = SDL_CreateGPUTexture(render.device_ptr, &ci);
+        if (!render.msaa_color) SDIE("SDL_CreateGPUTexture(msaa_color)");
+    }
 
     void imgui_xinit(const brender::renderer& renderer)
     {
@@ -90,7 +111,7 @@ namespace brender {
         SDL_zero(ii);
         ii.Device = renderer.device_ptr;
         ii.ColorTargetFormat = renderer.swap_format;
-        ii.MSAASamples = SDL_GPU_SAMPLECOUNT_1;
+        ii.MSAASamples = renderer.msaa;
         if (ImGui_ImplSDLGPU3_Init(&ii) == false)
             SDIE("ImGui_ImplSDLGPU3_Init()");
     }
@@ -116,6 +137,10 @@ namespace brender {
         renderer.swap_format = SDL_GetGPUSwapchainTextureFormat(renderer.device_ptr, renderer.window_ptr);
         if (renderer.swap_format == SDL_GPU_TEXTUREFORMAT_INVALID)
             SDIE("SDL_GetGPUSwapchainTextureFormat()");
+
+        renderer.msaa = SDL_GPU_SAMPLECOUNT_4;
+        renderer.msaa_color = nullptr;
+        recreate_msaa_color(renderer);
 
         imgui_xinit(renderer);
     }
@@ -158,12 +183,15 @@ namespace brender {
         {
             SDL_GPUColorTargetInfo color_target_info;
             SDL_zero(color_target_info);
-            color_target_info.texture = swap_tex;
+            color_target_info.texture = renderer.msaa_color;
             color_target_info.mip_level = 0;
             color_target_info.layer_or_depth_plane = 0;
             color_target_info.load_op = SDL_GPU_LOADOP_CLEAR;
-            color_target_info.store_op = SDL_GPU_STOREOP_STORE;
+            color_target_info.store_op = SDL_GPU_STOREOP_RESOLVE;
             color_target_info.clear_color = SDL_FColor{0.2f, 0.3f, 0.3f, 1.0f};
+            color_target_info.resolve_texture = swap_tex;
+            color_target_info.resolve_mip_level = 0;
+            color_target_info.resolve_layer = 0;
 
             frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &color_target_info, 1, NULL);
 
@@ -413,7 +441,7 @@ int main(int argc, char* argv[])
     rs.enable_depth_clip = true;
 
     SDL_GPUMultisampleState ms{};
-    ms.sample_count = SDL_GPU_SAMPLECOUNT_1;
+    ms.sample_count = renderer.msaa;
     ms.sample_mask = 0;
     ms.enable_mask = false;
     ms.enable_alpha_to_coverage = false;
@@ -469,6 +497,7 @@ int main(int argc, char* argv[])
             ImGui_ImplSDL3_ProcessEvent(&e);
             if (e.type == SDL_EVENT_QUIT) running = 0;
             if (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) running = 0;
+            if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) brender::recreate_msaa_color(renderer);
         }
 
         draw_function_data draw_data{ renderer.frame, pipe_cur, vbo };
@@ -482,6 +511,7 @@ int main(int argc, char* argv[])
     shader::destroy_pipeline(renderer.device_ptr, &pipe_cur);
     SDL_ReleaseGPUTransferBuffer(renderer.device_ptr, tbo);
     SDL_ReleaseGPUBuffer(renderer.device_ptr, vbo);
+    if (renderer.msaa_color) SDL_ReleaseGPUTexture(renderer.device_ptr, renderer.msaa_color);
 
     SDL_ReleaseWindowFromGPUDevice(renderer.device_ptr, renderer.window_ptr);
     SDL_DestroyWindow(renderer.window_ptr);
