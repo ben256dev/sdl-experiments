@@ -7,6 +7,8 @@
 
 using std::string;
 
+namespace shader {
+
 static std::vector<string> g_log;
 static bool g_autoscroll = true;
 
@@ -220,4 +222,6 @@ static void destroy_pipeline(SDL_GPUDevice* device, GpuPipeline* gp) {
     gp->p = nullptr;
     gp->f = nullptr;
     gp->v = nullptr;
+}
+
 }
