@@ -32,6 +32,7 @@ add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/imgui_demo.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlgpu3.cpp
 )
@@ -99,7 +100,29 @@ if(SHADERC_LIBRARIES MATCHES "shaderc_combined")
     endif()
 endif()
 
-add_executable(sdlgpu_imgui_triangle src/main.cpp)
+FetchContent_Declare(
+    spirv_reflect
+    GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Reflect.git
+    GIT_TAG main
+)
+FetchContent_MakeAvailable(spirv_reflect)
+
+set(SPIRV_REFLECT_TARGET "")
+if(TARGET spirv-reflect-static)
+    set(SPIRV_REFLECT_TARGET spirv-reflect-static)
+elseif(TARGET SPIRV-Reflect)
+    set(SPIRV_REFLECT_TARGET SPIRV-Reflect)
+endif()
+if(NOT SPIRV_REFLECT_TARGET)
+    add_library(spirv_reflect_c STATIC ${spirv_reflect_SOURCE_DIR}/spirv_reflect.c)
+    target_include_directories(spirv_reflect_c PUBLIC ${spirv_reflect_SOURCE_DIR})
+    set(SPIRV_REFLECT_TARGET spirv_reflect_c)
+endif()
+
+add_executable(sdlgpu_imgui_triangle
+    src/main.cpp
+    src/shader_reflect.cpp
+)
 target_include_directories(sdlgpu_imgui_triangle PRIVATE
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
@@ -107,6 +130,7 @@ target_include_directories(sdlgpu_imgui_triangle PRIVATE
     ${GLSLANG_INCLUDE_DIRS}
     ${SPIRV_TOOLS_INCLUDE_DIRS}
     ${SPIRV_TOOLS_OPT_INCLUDE_DIRS}
+    ${spirv_reflect_SOURCE_DIR}
 )
 target_link_libraries(sdlgpu_imgui_triangle PRIVATE
     SDL3::SDL3
@@ -115,6 +139,7 @@ target_link_libraries(sdlgpu_imgui_triangle PRIVATE
     blake3
     ${SHADERC_LIBRARIES}
     ${EXTRA_SHADERC_LIBS}
+    ${SPIRV_REFLECT_TARGET}
 )
 target_compile_definitions(sdlgpu_imgui_triangle PRIVATE
     SHADER_SRC_DIR="${SHADER_SRC_DIR}"

@@ -16,6 +16,7 @@
 #include <shaderc/shaderc.hpp>
 #include "blake3.h"
 #include "shader.h"
+#include "shader_reflect.h"
 
 static inline const char* sdl_basename(const char* p)
 {
@@ -138,7 +139,7 @@ namespace brender {
         if (renderer.swap_format == SDL_GPU_TEXTUREFORMAT_INVALID)
             SDIE("SDL_GetGPUSwapchainTextureFormat()");
 
-        renderer.msaa = SDL_GPU_SAMPLECOUNT_4;
+        renderer.msaa = SDL_GPU_SAMPLECOUNT_8;
         renderer.msaa_color = nullptr;
         recreate_msaa_color(renderer);
 
@@ -158,6 +159,7 @@ namespace brender {
         ImGui::Separator();
         for (auto& s : shader::g_log) ImGui::TextUnformatted(s.c_str());
         if (shader::g_autoscroll) ImGui::SetScrollHereY(1.0f);
+        ImGui::ShowDemoWindow();
         ImGui::End();
         ImGui::Render();
     }
@@ -326,9 +328,9 @@ int main(int argc, char* argv[])
     brender::xinit(renderer, brender_info);
 
     float vertices[] = {
-        -0.5f, -0.5f, 1.0f, 0.2f, 0.2f,
-         0.5f, -0.5f, 0.2f, 1.0f, 0.2f,
-         0.0f,  0.5f, 0.2f, 0.2f, 1.0f
+        1.0f, 0.2f, 0.2f,  -0.5f, -0.5f,   0.0f, 0.0f,
+        0.2f, 1.0f, 0.2f,   0.5f, -0.5f,   1.0f, 0.0f,
+        0.2f, 0.2f, 1.0f,   0.0f,  0.5f,   0.5f, 1.0f
     };
 
     SDL_GPUBufferCreateInfo vb_ci;
@@ -382,16 +384,23 @@ int main(int argc, char* argv[])
     shader_program.vertex_shader   = &vert;
     shader_program.fragment_shader = &frag;
 
+    ReflectedVertexInput vin_ref{};
+    if (!reflect_vertex_input(shader_program.vertex_shader->spirv, vin_ref)) DIE("reflect_vertex_input");
+
+    ReflectedResources vres{}, fres{};
+    if (!reflect_resources(shader_program.vertex_shader->spirv, vres)) DIE("reflect_resources_vs");
+    if (!reflect_resources(shader_program.fragment_shader->spirv, fres)) DIE("reflect_resources_fs");
+
     SDL_GPUShaderCreateInfo vci{};
     vci.code_size = shader_program.vertex_shader->spirv.size() * sizeof(uint32_t);
     vci.code = reinterpret_cast<const Uint8*>(shader_program.vertex_shader->spirv.data());
     vci.entrypoint = "main";
     vci.format = SDL_GPU_SHADERFORMAT_SPIRV;
     vci.stage = SDL_GPU_SHADERSTAGE_VERTEX;
-    vci.num_samplers = 0;
-    vci.num_storage_textures = 0;
-    vci.num_storage_buffers = 0;
-    vci.num_uniform_buffers = 0;
+    vci.num_samplers = vres.num_samplers;
+    vci.num_storage_textures = vres.num_storage_textures;
+    vci.num_storage_buffers = vres.num_storage_buffers;
+    vci.num_uniform_buffers = vres.num_uniform_buffers;
     vci.props = 0;
 
     SDL_GPUShaderCreateInfo fci{};
@@ -400,10 +409,10 @@ int main(int argc, char* argv[])
     fci.entrypoint = "main";
     fci.format = SDL_GPU_SHADERFORMAT_SPIRV;
     fci.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
-    fci.num_samplers = 0;
-    fci.num_storage_textures = 0;
-    fci.num_storage_buffers = 0;
-    fci.num_uniform_buffers = 0;
+    fci.num_samplers = fres.num_samplers;
+    fci.num_storage_textures = fres.num_storage_textures;
+    fci.num_storage_buffers = fres.num_storage_buffers;
+    fci.num_uniform_buffers = fres.num_uniform_buffers;
     fci.props = 0;
 
     SDL_GPUShader* vshader = SDL_CreateGPUShader(renderer.device_ptr, &vci);
@@ -411,27 +420,11 @@ int main(int argc, char* argv[])
     SDL_GPUShader* fshader = SDL_CreateGPUShader(renderer.device_ptr, &fci);
     if (!fshader) SDIE("SDL_CreateGPUShader(fragment)");
 
-    SDL_GPUVertexAttribute attrs[2];
-    attrs[0].location = 0;
-    attrs[0].buffer_slot = 0;
-    attrs[0].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2;
-    attrs[0].offset = 0;
-    attrs[1].location = 1;
-    attrs[1].buffer_slot = 0;
-    attrs[1].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3;
-    attrs[1].offset = sizeof(float) * 2;
-
-    SDL_GPUVertexBufferDescription vbuf{};
-    vbuf.slot = 0;
-    vbuf.pitch = sizeof(float) * 5;
-    vbuf.input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX;
-    vbuf.instance_step_rate = 0;
-
     SDL_GPUVertexInputState vin{};
-    vin.vertex_buffer_descriptions = &vbuf;
+    vin.vertex_buffer_descriptions = &vin_ref.buffer_desc;
     vin.num_vertex_buffers = 1;
-    vin.vertex_attributes = attrs;
-    vin.num_vertex_attributes = 2;
+    vin.vertex_attributes = vin_ref.attributes.data();
+    vin.num_vertex_attributes = (Uint32)vin_ref.attributes.size();
 
     SDL_GPURasterizerState rs{};
     rs.fill_mode = SDL_GPU_FILLMODE_FILL;
