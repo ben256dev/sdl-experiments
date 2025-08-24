@@ -17,6 +17,7 @@
 #include "blake3.h"
 #include "shader.h"
 #include "shader_reflect.h"
+#include "pipeline_config.h"
 
 static inline const char* sdl_basename(const char* p)
 {
@@ -79,14 +80,19 @@ namespace brender {
         SDL_GPUTextureFormat  swap_format;
         SDL_GPUTexture*       msaa_color;
         SDL_GPUSampleCount    msaa;
+        SDL_GPUSampleCount    imgui_msaa;
         brender::frame        frame;
     };
 
     static void recreate_msaa_color(brender::renderer& render)
     {
+        if (render.msaa_color) {
+            SDL_ReleaseGPUTexture(render.device_ptr, render.msaa_color);
+            render.msaa_color = nullptr;
+        }
+        if (render.msaa <= SDL_GPU_SAMPLECOUNT_1) return;
         int pxw = 0, pxh = 0;
         SDL_GetWindowSizeInPixels(render.window_ptr, &pxw, &pxh);
-        if (render.msaa_color) SDL_ReleaseGPUTexture(render.device_ptr, render.msaa_color);
         SDL_GPUTextureCreateInfo ci{};
         ci.type = SDL_GPU_TEXTURETYPE_2D;
         ci.format = render.swap_format;
@@ -101,20 +107,49 @@ namespace brender {
         if (!render.msaa_color) SDIE("SDL_CreateGPUTexture(msaa_color)");
     }
 
-    void imgui_xinit(const brender::renderer& renderer)
+    static void imgui_backend_shutdown()
     {
-        IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
-        ImGuiIO& io = ImGui::GetIO();
-        io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+        ImGui_ImplSDLGPU3_Shutdown();
+        ImGui_ImplSDL3_Shutdown();
+    }
+
+    static void imgui_backend_init(const brender::renderer& renderer)
+    {
         ImGui_ImplSDL3_InitForSDLGPU(renderer.window_ptr);
         ImGui_ImplSDLGPU3_InitInfo ii;
         SDL_zero(ii);
         ii.Device = renderer.device_ptr;
         ii.ColorTargetFormat = renderer.swap_format;
-        ii.MSAASamples = renderer.msaa;
+        ii.MSAASamples = SDL_GPU_SAMPLECOUNT_1;
         if (ImGui_ImplSDLGPU3_Init(&ii) == false)
             SDIE("ImGui_ImplSDLGPU3_Init()");
+    }
+
+    void imgui_xinit(brender::renderer& renderer)
+    {
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+        io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+        ImGui::StyleColorsDark();
+        imgui_backend_init(renderer);
+        renderer.imgui_msaa = SDL_GPU_SAMPLECOUNT_1;
+    }
+
+    static void imgui_reinit_if_needed(brender::renderer& renderer)
+    {
+        if (renderer.imgui_msaa == SDL_GPU_SAMPLECOUNT_1) return;
+        ImGui_ImplSDLGPU3_Shutdown();
+        ImGui_ImplSDL3_Shutdown();
+        ImGui_ImplSDL3_InitForSDLGPU(renderer.window_ptr);
+        ImGui_ImplSDLGPU3_InitInfo ii;
+        SDL_zero(ii);
+        ii.Device = renderer.device_ptr;
+        ii.ColorTargetFormat = renderer.swap_format;
+        ii.MSAASamples = SDL_GPU_SAMPLECOUNT_1;
+        if (ImGui_ImplSDLGPU3_Init(&ii) == false) SDIE("ImGui_ImplSDLGPU3_Init()");
+        renderer.imgui_msaa = SDL_GPU_SAMPLECOUNT_1;
     }
 
     void xinit(brender::renderer& renderer, const brender::create_info& create_info)
@@ -140,6 +175,7 @@ namespace brender {
             SDIE("SDL_GetGPUSwapchainTextureFormat()");
 
         renderer.msaa = SDL_GPU_SAMPLECOUNT_8;
+        renderer.imgui_msaa = SDL_GPU_SAMPLECOUNT_1;
         renderer.msaa_color = nullptr;
         recreate_msaa_color(renderer);
 
@@ -148,8 +184,8 @@ namespace brender {
 
     void imgui_render()
     {
-        ImGui_ImplSDLGPU3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
+        ImGui_ImplSDLGPU3_NewFrame();
         ImGui::NewFrame();
         ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
         ImGui::Begin("Reload Log");
@@ -159,8 +195,9 @@ namespace brender {
         ImGui::Separator();
         for (auto& s : shader::g_log) ImGui::TextUnformatted(s.c_str());
         if (shader::g_autoscroll) ImGui::SetScrollHereY(1.0f);
-        ImGui::ShowDemoWindow();
         ImGui::End();
+        static bool show_demo = true;
+        ImGui::ShowDemoWindow(&show_demo);
         ImGui::Render();
     }
 
@@ -183,29 +220,67 @@ namespace brender {
         SDL_AcquireGPUSwapchainTexture(frame.command_buffer_ptr, renderer.window_ptr, &swap_tex, NULL, NULL);
         if (swap_tex)
         {
-            SDL_GPUColorTargetInfo color_target_info;
-            SDL_zero(color_target_info);
-            color_target_info.texture = renderer.msaa_color;
-            color_target_info.mip_level = 0;
-            color_target_info.layer_or_depth_plane = 0;
-            color_target_info.load_op = SDL_GPU_LOADOP_CLEAR;
-            color_target_info.store_op = SDL_GPU_STOREOP_RESOLVE;
-            color_target_info.clear_color = SDL_FColor{0.2f, 0.3f, 0.3f, 1.0f};
-            color_target_info.resolve_texture = swap_tex;
-            color_target_info.resolve_mip_level = 0;
-            color_target_info.resolve_layer = 0;
+            if (renderer.msaa > SDL_GPU_SAMPLECOUNT_1) {
+                SDL_GPUColorTargetInfo ct1;
+                SDL_zero(ct1);
+                ct1.texture = renderer.msaa_color;
+                ct1.mip_level = 0;
+                ct1.layer_or_depth_plane = 0;
+                ct1.load_op = SDL_GPU_LOADOP_CLEAR;
+                ct1.store_op = SDL_GPU_STOREOP_RESOLVE;
+                ct1.clear_color = SDL_FColor{0.2f, 0.3f, 0.3f, 1.0f};
+                ct1.resolve_texture = swap_tex;
+                ct1.resolve_mip_level = 0;
+                ct1.resolve_layer = 0;
 
-            frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &color_target_info, 1, NULL);
+                frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &ct1, 1, NULL);
 
-            if (fn && data)
-                fn(data);
+                if (fn && data)
+                    fn(data);
 
-            brender::imgui_submit(renderer.frame);
+                SDL_EndGPURenderPass(frame.render_pass_ptr);
 
-            SDL_EndGPURenderPass(frame.render_pass_ptr);
+                SDL_GPUColorTargetInfo ct2;
+                SDL_zero(ct2);
+                ct2.texture = swap_tex;
+                ct2.mip_level = 0;
+                ct2.layer_or_depth_plane = 0;
+                ct2.load_op = SDL_GPU_LOADOP_LOAD;
+                ct2.store_op = SDL_GPU_STOREOP_STORE;
+
+                frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &ct2, 1, NULL);
+
+                brender::imgui_submit(renderer.frame);
+
+                SDL_EndGPURenderPass(frame.render_pass_ptr);
+            } else {
+                SDL_GPUColorTargetInfo ct;
+                SDL_zero(ct);
+                ct.texture = swap_tex;
+                ct.mip_level = 0;
+                ct.layer_or_depth_plane = 0;
+                ct.load_op = SDL_GPU_LOADOP_CLEAR;
+                ct.store_op = SDL_GPU_STOREOP_STORE;
+                ct.clear_color = SDL_FColor{0.2f, 0.3f, 0.3f, 1.0f};
+
+                frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &ct, 1, NULL);
+
+                if (fn && data)
+                    fn(data);
+
+                brender::imgui_submit(renderer.frame);
+
+                SDL_EndGPURenderPass(frame.render_pass_ptr);
+            }
         }
 
         SDL_SubmitGPUCommandBuffer(frame.command_buffer_ptr);
+
+        if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+            ImGui::UpdatePlatformWindows();
+            ImGui::RenderPlatformWindowsDefault();
+        }
+
         SDL_Delay(1);
     }
 
@@ -321,6 +396,20 @@ void draw_function(const void* data)
     SDL_DrawGPUPrimitives(d.frame.render_pass_ptr, 3, 1, 0, 0);
 }
 
+static shaderc_optimization_level map_opt_level(const std::string& s) {
+    if (s == "zero" || s == "0") return shaderc_optimization_level_zero;
+    if (s == "size") return shaderc_optimization_level_size;
+    if (s == "performance" || s == "p") return shaderc_optimization_level_performance;
+    const char* e = std::getenv("SHADERC_OPT");
+    if (e) {
+        std::string ev(e);
+        if (ev == "0" || ev == "zero") return shaderc_optimization_level_zero;
+        if (ev == "size") return shaderc_optimization_level_size;
+        if (ev == "performance" || ev == "p") return shaderc_optimization_level_performance;
+    }
+    return shaderc_optimization_level_performance;
+}
+
 int main(int argc, char* argv[])
 {
     brender::renderer renderer;
@@ -328,9 +417,9 @@ int main(int argc, char* argv[])
     brender::xinit(renderer, brender_info);
 
     float vertices[] = {
-        1.0f, 0.2f, 0.2f,  -0.5f, -0.5f,   0.0f, 0.0f,
-        0.2f, 1.0f, 0.2f,   0.5f, -0.5f,   1.0f, 0.0f,
-        0.2f, 0.2f, 1.0f,   0.0f,  0.5f,   0.5f, 1.0f
+        -0.5f, -0.5f, 1.0f, 0.2f, 0.2f,
+         0.5f, -0.5f, 0.2f, 1.0f, 0.2f,
+         0.0f,  0.5f, 0.2f, 0.2f, 1.0f
     };
 
     SDL_GPUBufferCreateInfo vb_ci;
@@ -377,19 +466,42 @@ int main(int argc, char* argv[])
     shader::file& frag = shader_manager.files.emplace_back();
     shader::load(frag, "triangle.frag");
 
+    std::string cfg_path = std::string(SHADER_SRC_DIR) + "/" + vert.name + "+" + frag.name + ".pipeline.json";
+    PipelineConfig cfg{};
+    load_pipeline_config(cfg_path, cfg, 1);
+
+    std::string global_opt = cfg.shaderc_optimization;
+    std::string vs_opt = cfg.shaderc_optimization_vs.size() ? cfg.shaderc_optimization_vs : global_opt;
+    std::string fs_opt = cfg.shaderc_optimization_fs.size() ? cfg.shaderc_optimization_fs : global_opt;
+    if (vs_opt.empty()) vs_opt = "performance";
+    if (fs_opt.empty()) fs_opt = "performance";
+    shaderc_optimization_level vs_level = map_opt_level(vs_opt);
+    shaderc_optimization_level fs_level = map_opt_level(fs_opt);
+
+    shader_manager.opts.SetOptimizationLevel(vs_level);
     shader::compile(shader_manager, vert);
+    shader_manager.opts.SetOptimizationLevel(fs_level);
     shader::compile(shader_manager, frag);
 
     shader::program& shader_program = shader_manager.programs.emplace_back();
-    shader_program.vertex_shader   = &vert;
+    shader_program.vertex_shader = &vert;
     shader_program.fragment_shader = &frag;
 
     ReflectedVertexInput vin_ref{};
     if (!reflect_vertex_input(shader_program.vertex_shader->spirv, vin_ref)) DIE("reflect_vertex_input");
+    pack_tight(vin_ref);
 
     ReflectedResources vres{}, fres{};
     if (!reflect_resources(shader_program.vertex_shader->spirv, vres)) DIE("reflect_resources_vs");
     if (!reflect_resources(shader_program.fragment_shader->spirv, fres)) DIE("reflect_resources_fs");
+
+    SDL_GPUSampleCount requested = map_samples(cfg.sample_count);
+    SDL_GPUSampleCount actual = choose_supported(renderer.device_ptr, renderer.swap_format, requested);
+    if (renderer.msaa != actual) {
+        renderer.msaa = actual;
+        brender::recreate_msaa_color(renderer);
+        brender::imgui_reinit_if_needed(renderer);
+    }
 
     SDL_GPUShaderCreateInfo vci{};
     vci.code_size = shader_program.vertex_shader->spirv.size() * sizeof(uint32_t);
@@ -428,8 +540,8 @@ int main(int argc, char* argv[])
 
     SDL_GPURasterizerState rs{};
     rs.fill_mode = SDL_GPU_FILLMODE_FILL;
-    rs.cull_mode = SDL_GPU_CULLMODE_NONE;
-    rs.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+    rs.cull_mode = cfg.cull;
+    rs.front_face = cfg.front_face;
     rs.enable_depth_bias = false;
     rs.enable_depth_clip = true;
 
@@ -440,33 +552,53 @@ int main(int argc, char* argv[])
     ms.enable_alpha_to_coverage = false;
 
     SDL_GPUDepthStencilState ds{};
-    ds.enable_depth_test = false;
-    ds.enable_depth_write = false;
+    ds.enable_depth_test = cfg.depth.enable;
+    ds.enable_depth_write = cfg.depth.write;
     ds.enable_stencil_test = false;
-    ds.compare_op = SDL_GPU_COMPAREOP_ALWAYS;
+    ds.compare_op = cfg.depth.compare;
     ds.compare_mask = 0xFF;
     ds.write_mask = 0xFF;
 
-    SDL_GPUColorTargetBlendState blend{};
-    blend.enable_blend = false;
-    blend.enable_color_write_mask = false;
-    blend.color_write_mask = 0;
-
-    SDL_GPUColorTargetDescription cdesc{};
-    cdesc.format = renderer.swap_format;
-    cdesc.blend_state = blend;
+    std::vector<SDL_GPUColorTargetDescription> cdescs;
+    cdescs.resize(cfg.blends.empty() ? 1 : cfg.blends.size());
+    for (size_t i = 0; i < cdescs.size(); i++) {
+        SDL_GPUColorTargetBlendState b{};
+        if (!cfg.blends.empty()) {
+            b.enable_blend = cfg.blends[i].enable;
+            b.enable_color_write_mask = true;
+            b.color_write_mask = cfg.blends[i].write_mask;
+            b.src_color_blendfactor = cfg.blends[i].src_color;
+            b.dst_color_blendfactor = cfg.blends[i].dst_color;
+            b.color_blend_op = cfg.blends[i].color_op;
+            b.src_alpha_blendfactor = cfg.blends[i].src_alpha;
+            b.dst_alpha_blendfactor = cfg.blends[i].dst_alpha;
+            b.alpha_blend_op = cfg.blends[i].alpha_op;
+        } else {
+            b.enable_blend = false;
+            b.enable_color_write_mask = true;
+            b.color_write_mask = SDL_GPU_COLORCOMPONENT_R | SDL_GPU_COLORCOMPONENT_G | SDL_GPU_COLORCOMPONENT_B | SDL_GPU_COLORCOMPONENT_A;
+            b.src_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+            b.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ZERO;
+            b.color_blend_op = SDL_GPU_BLENDOP_ADD;
+            b.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+            b.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ZERO;
+            b.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+        }
+        cdescs[i].format = renderer.swap_format;
+        cdescs[i].blend_state = b;
+    }
 
     SDL_GPUGraphicsPipelineTargetInfo ti{};
-    ti.color_target_descriptions = &cdesc;
-    ti.num_color_targets = 1;
-    ti.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_INVALID;
-    ti.has_depth_stencil_target = false;
+    ti.color_target_descriptions = cdescs.data();
+    ti.num_color_targets = (Uint32)cdescs.size();
+    ti.depth_stencil_format = cfg.depth.enable ? cfg.depth.format : SDL_GPU_TEXTUREFORMAT_INVALID;
+    ti.has_depth_stencil_target = cfg.depth.enable;
 
     SDL_GPUGraphicsPipelineCreateInfo pci{};
     pci.vertex_shader = vshader;
     pci.fragment_shader = fshader;
     pci.vertex_input_state = vin;
-    pci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+    pci.primitive_type = cfg.primitive;
     pci.rasterizer_state = rs;
     pci.multisample_state = ms;
     pci.depth_stencil_state = ds;
@@ -497,8 +629,7 @@ int main(int argc, char* argv[])
         brender::draw(renderer, &draw_function, &draw_data);
     }
 
-    ImGui_ImplSDLGPU3_Shutdown();
-    ImGui_ImplSDL3_Shutdown();
+    brender::imgui_backend_shutdown();
     ImGui::DestroyContext();
 
     shader::destroy_pipeline(renderer.device_ptr, &pipe_cur);

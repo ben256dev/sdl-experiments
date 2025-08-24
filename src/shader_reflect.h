@@ -19,3 +19,4 @@ struct ReflectedResources {
 bool reflect_vertex_input(const std::vector<uint32_t>& spirv, ReflectedVertexInput& out);
 bool reflect_resources(const std::vector<uint32_t>& spirv, ReflectedResources& out);
 
+void pack_tight(ReflectedVertexInput& out);

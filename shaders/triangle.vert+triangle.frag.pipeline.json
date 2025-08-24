@@ -1,0 +1,15 @@
+{
+    "primitive": "triangle_list",
+    "cull": "none",
+    "front_face": "ccw",
+    "depth": { "enable": false, "format": "invalid", "write": false, "compare": "always" },
+    "msaa": { "sample_count": 1 },
+    "blend": [
+        { "enable": false, "write_mask": "rgba",
+          "src_color": "one", "dst_color": "zero", "color_blend_op": "add",
+          "src_alpha": "one", "dst_alpha": "zero", "alpha_blend_op": "add" }
+    ],
+    "vertex_layout": "auto",
+    "shaderc": { "vertex": "zero", "fragment": "performance" }
+}
+

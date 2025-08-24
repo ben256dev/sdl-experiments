@@ -27,6 +27,12 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(glm)
 
+FetchContent_Declare(json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+)
+FetchContent_MakeAvailable(json)
+
 add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -122,6 +128,7 @@ endif()
 add_executable(sdlgpu_imgui_triangle
     src/main.cpp
     src/shader_reflect.cpp
+    src/pipeline_config.cpp
 )
 target_include_directories(sdlgpu_imgui_triangle PRIVATE
     ${imgui_SOURCE_DIR}
@@ -140,6 +147,7 @@ target_link_libraries(sdlgpu_imgui_triangle PRIVATE
     ${SHADERC_LIBRARIES}
     ${EXTRA_SHADERC_LIBS}
     ${SPIRV_REFLECT_TARGET}
+    nlohmann_json::nlohmann_json
 )
 target_compile_definitions(sdlgpu_imgui_triangle PRIVATE
     SHADER_SRC_DIR="${SHADER_SRC_DIR}"
