@@ -1,0 +1,38 @@
+{
+  "vertex_shader": "triangle.vert",
+  "fragment_shader": "triangle.frag",
+
+  "shaderc_optimization": "performance",
+  "shaderc_optimization_vs": "",
+  "shaderc_optimization_fs": "",
+
+  "sample_count": 1,
+
+  "primitive": "triangle_list",
+
+  "cull": "none",
+  "front_face": "ccw",
+
+  "depth": {
+    "enable": false,
+    "write": false,
+    "compare": "always",
+    "format": "invalid"
+  },
+
+  "blends": [
+    {
+      "enable": false,
+      "write_mask": "rgba",
+      "src_color": "one",
+      "dst_color": "zero",
+      "color_op": "add",
+      "src_alpha": "one",
+      "dst_alpha": "zero",
+      "alpha_op": "add"
+    }
+  ],
+
+  "vertex_layout": "auto"
+}
+
