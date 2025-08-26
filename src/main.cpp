@@ -551,7 +551,6 @@ namespace shader
         multisample_state.sample_count = renderer.msaa;
         multisample_state.sample_mask = 0;
         multisample_state.enable_mask = false;
-        multisample_state.enable_alpha_to_coverage = false;
 
         SDL_GPUDepthStencilState depth_stencil_state{};
         depth_stencil_state.enable_depth_test = cfg.depth.enable;
