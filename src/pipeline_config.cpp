@@ -76,6 +76,7 @@ SDL_GPUSampleCount map_samples(Uint32 n) {
     }
 }
 
+
 SDL_GPUSampleCount choose_supported(SDL_GPUDevice* dev, SDL_GPUTextureFormat fmt, SDL_GPUSampleCount desired) {
     if (SDL_GPUTextureSupportsSampleCount(dev, fmt, desired)) return desired;
     SDL_GPUSampleCount cands[] = { SDL_GPU_SAMPLECOUNT_8, SDL_GPU_SAMPLECOUNT_4, SDL_GPU_SAMPLECOUNT_2, SDL_GPU_SAMPLECOUNT_1 };

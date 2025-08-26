@@ -8,6 +8,8 @@ One-time configure step
 cmake -S . -B build
 ```
 
+For debugging use the above with ``-DCMAKE_BUILD_TYPE=Debug``
+
 Build and run
 
 ```bash

@@ -6,4 +6,3 @@ void main() {
     v_col = in_col;
     gl_Position = vec4(in_pos, 0.0, 1.0);
 }
-

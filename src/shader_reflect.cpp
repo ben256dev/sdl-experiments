@@ -123,3 +123,32 @@ bool reflect_resources(const std::vector<uint32_t>& spirv, ReflectedResources& o
     return true;
 }
 
+
+static SDL_GPUSampleCount map_samples(Uint32 count)
+{
+    switch (count)
+    {
+        case 8: return SDL_GPU_SAMPLECOUNT_8;
+        case 4: return SDL_GPU_SAMPLECOUNT_4;
+        case 2: return SDL_GPU_SAMPLECOUNT_2;
+        default: return SDL_GPU_SAMPLECOUNT_1;
+    }
+}
+
+static SDL_GPUSampleCount choose_supported(SDL_GPUDevice* device_ptr, SDL_GPUTextureFormat format, SDL_GPUSampleCount desired)
+{
+    if (SDL_GPUTextureSupportsSampleCount(device_ptr, format, desired))
+    {
+        return desired;
+    }
+    SDL_GPUSampleCount candidates[] = { SDL_GPU_SAMPLECOUNT_8, SDL_GPU_SAMPLECOUNT_4, SDL_GPU_SAMPLECOUNT_2, SDL_GPU_SAMPLECOUNT_1 };
+    for (SDL_GPUSampleCount candidate : candidates)
+    {
+        if (candidate <= desired && SDL_GPUTextureSupportsSampleCount(device_ptr, format, candidate))
+        {
+            return candidate;
+        }
+    }
+    return SDL_GPU_SAMPLECOUNT_1;
+}
+
