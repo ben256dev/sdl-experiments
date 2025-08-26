@@ -54,6 +54,9 @@ static inline void die_at(const char* what, const char* file, int line)
 
 #define DIE(what) die_at((what), sdl_basename(__FILE__), __LINE__)
 
+enum class SceneMode { Docked, Fullscreen };
+static SceneMode g_mode = SceneMode::Docked;
+
 namespace brender
 {
 
@@ -81,13 +84,18 @@ namespace brender
     };
 
     struct renderer {
-        SDL_Window*           window_ptr;
-        SDL_GPUDevice*        device_ptr;
-        SDL_GPUTextureFormat  swap_format;
-        SDL_GPUTexture*       msaa_color;
-        SDL_GPUSampleCount    msaa;
-        SDL_GPUSampleCount    imgui_msaa;
-        brender::frame        frame;
+        SDL_Window* window_ptr = nullptr;
+        SDL_GPUDevice* device_ptr = nullptr;
+        SDL_GPUTextureFormat swap_format = SDL_GPU_TEXTUREFORMAT_INVALID;
+        SDL_GPUTexture* msaa_color = nullptr;
+        SDL_GPUSampleCount msaa = SDL_GPU_SAMPLECOUNT_1;
+        SDL_GPUSampleCount imgui_msaa = SDL_GPU_SAMPLECOUNT_1;
+        brender::frame frame{};
+        SDL_GPUTexture* scene_msaa = nullptr;
+        SDL_GPUTexture* scene_tex = nullptr;
+        SDL_GPUSampler* scene_sampler = nullptr;
+        SDL_GPUTextureSamplerBinding scene_binding{};
+        int scene_w = 0, scene_h = 0;
     };
 
     static void create_target(brender::renderer& render)
@@ -141,27 +149,134 @@ namespace brender
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO();
         io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
-        io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+        io.Fonts->AddFontDefault();
         ImGui::StyleColorsDark();
         imgui_backend_init(renderer);
         renderer.imgui_msaa = SDL_GPU_SAMPLECOUNT_1;
     }
 
-    static void imgui_reinit_if_needed(brender::renderer& renderer)
+    using draw_func_ptr = void(*)(const void*);
+
+    static void create_scene_targets(brender::renderer& r, int w, int h) {
+        if (r.scene_msaa) SDL_ReleaseGPUTexture(r.device_ptr, r.scene_msaa);
+        if (r.scene_tex)  SDL_ReleaseGPUTexture(r.device_ptr, r.scene_tex);
+        SDL_GPUTextureCreateInfo msaa{};
+        msaa.type = SDL_GPU_TEXTURETYPE_2D;
+        msaa.format = r.swap_format;
+        msaa.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
+        msaa.width = (Uint32)w;
+        msaa.height = (Uint32)h;
+        msaa.layer_count_or_depth = 1;
+        msaa.num_levels = 1;
+        msaa.sample_count = r.msaa;
+        r.scene_msaa = SDL_CreateGPUTexture(r.device_ptr, &msaa);
+        SDL_GPUTextureCreateInfo single{};
+        single.type = SDL_GPU_TEXTURETYPE_2D;
+        single.format = r.swap_format;
+        single.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        single.width = (Uint32)w;
+        single.height = (Uint32)h;
+        single.layer_count_or_depth = 1;
+        single.num_levels = 1;
+        single.sample_count = SDL_GPU_SAMPLECOUNT_1;
+        r.scene_tex = SDL_CreateGPUTexture(r.device_ptr, &single);
+        if (!r.scene_sampler) {
+            SDL_GPUSamplerCreateInfo sci{};
+            r.scene_sampler = SDL_CreateGPUSampler(r.device_ptr, &sci);
+        }
+        r.scene_binding.texture = r.scene_tex;
+        r.scene_binding.sampler = r.scene_sampler;
+        r.scene_w = w;
+        r.scene_h = h;
+    }
+
+    static void imgui_scene_window(brender::renderer& r) {
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+        ImGui::Begin("Scene");
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        int w = (int)avail.x, h = (int)avail.y;
+        if (w < 1) w = 1;
+        if (h < 1) h = 1;
+        if (w != r.scene_w || h != r.scene_h) create_scene_targets(r, w, h);
+        if (!r.scene_tex) create_scene_targets(r, w, h);
+        ImGuiPlatformIO& pio = ImGui::GetPlatformIO();
+        if (pio.Renderer_RenderState && r.scene_sampler) {
+            auto* rs = (ImGui_ImplSDLGPU3_RenderState*)pio.Renderer_RenderState;
+            rs->SamplerCurrent = r.scene_sampler;
+        }
+        ImGui::Image((ImTextureID)r.scene_tex, avail);
+        ImGui::End();
+        ImGui::PopStyleVar();
+    }
+
+    void draw(brender::renderer& renderer, brender::draw_func_ptr draw_func, const void* draw_data)
     {
-        if (renderer.imgui_msaa == SDL_GPU_SAMPLECOUNT_1)
+        if (g_mode == SceneMode::Docked) {
+            ImGui_ImplSDL3_NewFrame();
+            ImGui_ImplSDLGPU3_NewFrame();
+            ImGui::NewFrame();
+            ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
+            imgui_scene_window(renderer);
+            ImGui::Render();
+        }
+
+        brender::frame& frame = renderer.frame;
+        frame.command_buffer_ptr = SDL_AcquireGPUCommandBuffer(renderer.device_ptr);
+
+        SDL_GPUTexture* swap_texture = NULL;
+        Uint32 swap_w = 0, swap_h = 0;
+        bool ok = SDL_AcquireGPUSwapchainTexture(frame.command_buffer_ptr, renderer.window_ptr, &swap_texture, &swap_w, &swap_h);
+        if (!ok || !swap_texture) {
+            SDL_SubmitGPUCommandBuffer(frame.command_buffer_ptr);
+            SDL_Delay(1);
             return;
-        ImGui_ImplSDLGPU3_Shutdown();
-        ImGui_ImplSDL3_Shutdown();
-        ImGui_ImplSDL3_InitForSDLGPU(renderer.window_ptr);
-        ImGui_ImplSDLGPU3_InitInfo init_info;
-        SDL_zero(init_info);
-        init_info.Device = renderer.device_ptr;
-        init_info.ColorTargetFormat = renderer.swap_format;
-        init_info.MSAASamples = SDL_GPU_SAMPLECOUNT_1;
-        if (ImGui_ImplSDLGPU3_Init(&init_info) == false)
-            SDIE("ImGui_ImplSDLGPU3_Init()");
-        renderer.imgui_msaa = SDL_GPU_SAMPLECOUNT_1;
+        }
+
+        if (g_mode == SceneMode::Docked) {
+            SDL_GPUColorTargetInfo scene_t{};
+            scene_t.texture = renderer.scene_msaa;
+            scene_t.load_op = SDL_GPU_LOADOP_CLEAR;
+            scene_t.store_op = SDL_GPU_STOREOP_RESOLVE;
+            scene_t.clear_color = SDL_FColor{0.2f,0.3f,0.3f,1.0f};
+            scene_t.resolve_texture = renderer.scene_tex;
+            frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &scene_t, 1, NULL);
+            if (draw_func && draw_data) draw_func(draw_data);
+            SDL_EndGPURenderPass(frame.render_pass_ptr);
+
+            SDL_GPUColorTargetInfo ui_t{};
+            ui_t.texture = swap_texture;
+            ui_t.load_op = SDL_GPU_LOADOP_CLEAR;
+            ui_t.store_op = SDL_GPU_STOREOP_STORE;
+            ui_t.clear_color = SDL_FColor{0.1f,0.1f,0.1f,1.0f};
+            frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &ui_t, 1, NULL);
+            ImGui_ImplSDLGPU3_PrepareDrawData(ImGui::GetDrawData(), frame.command_buffer_ptr);
+            ImGui_ImplSDLGPU3_RenderDrawData(ImGui::GetDrawData(), frame.command_buffer_ptr, frame.render_pass_ptr, NULL);
+            SDL_EndGPURenderPass(frame.render_pass_ptr);
+        } else {
+            if (renderer.msaa > SDL_GPU_SAMPLECOUNT_1) {
+                SDL_GPUColorTargetInfo scene_t{};
+                scene_t.texture = renderer.msaa_color;
+                scene_t.load_op = SDL_GPU_LOADOP_CLEAR;
+                scene_t.store_op = SDL_GPU_STOREOP_RESOLVE;
+                scene_t.clear_color = SDL_FColor{0.2f,0.3f,0.3f,1.0f};
+                scene_t.resolve_texture = swap_texture;
+                frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &scene_t, 1, NULL);
+                if (draw_func && draw_data) draw_func(draw_data);
+                SDL_EndGPURenderPass(frame.render_pass_ptr);
+            } else {
+                SDL_GPUColorTargetInfo t{};
+                t.texture = swap_texture;
+                t.load_op = SDL_GPU_LOADOP_CLEAR;
+                t.store_op = SDL_GPU_STOREOP_STORE;
+                t.clear_color = SDL_FColor{0.2f,0.3f,0.3f,1.0f};
+                frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &t, 1, NULL);
+                if (draw_func && draw_data) draw_func(draw_data);
+                SDL_EndGPURenderPass(frame.render_pass_ptr);
+            }
+        }
+
+        SDL_SubmitGPUCommandBuffer(frame.command_buffer_ptr);
+        SDL_Delay(1);
     }
 
     void xinit(brender::renderer& renderer, const brender::create_info& create_info)
@@ -192,112 +307,6 @@ namespace brender
         create_target(renderer);
 
         imgui_xinit(renderer);
-    }
-
-    void imgui_render()
-    {
-        ImGui_ImplSDL3_NewFrame();
-        ImGui_ImplSDLGPU3_NewFrame();
-        ImGui::NewFrame();
-        ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
-        ImGui::Begin("Reload Log");
-        if (ImGui::Button("Clear")) shader::g_log.clear();
-        ImGui::SameLine();
-        ImGui::Checkbox("Auto-scroll", &shader::g_autoscroll);
-        ImGui::Separator();
-        for (auto& line_text : shader::g_log) ImGui::TextUnformatted(line_text.c_str());
-        if (shader::g_autoscroll) ImGui::SetScrollHereY(1.0f);
-        ImGui::End();
-        static bool show_demo = true;
-        ImGui::ShowDemoWindow(&show_demo);
-        ImGui::Render();
-    }
-
-    void imgui_submit(brender::frame& frame)
-    {
-        ImGui_ImplSDLGPU3_PrepareDrawData(ImGui::GetDrawData(), frame.command_buffer_ptr);
-        ImGui_ImplSDLGPU3_RenderDrawData(ImGui::GetDrawData(), frame.command_buffer_ptr, frame.render_pass_ptr, NULL);
-    }
-
-    using draw_func_ptr = void(*)(const void*);
-
-    void draw(brender::renderer& renderer, brender::draw_func_ptr draw_func, const void* draw_data)
-    {
-        brender::imgui_render();
-
-        brender::frame& frame = renderer.frame;
-        frame.command_buffer_ptr = SDL_AcquireGPUCommandBuffer(renderer.device_ptr);
-
-        SDL_GPUTexture* swap_texture = NULL;
-        SDL_AcquireGPUSwapchainTexture(frame.command_buffer_ptr, renderer.window_ptr, &swap_texture, NULL, NULL);
-        if (swap_texture)
-        {
-            if (renderer.msaa > SDL_GPU_SAMPLECOUNT_1)
-            {
-                SDL_GPUColorTargetInfo scene_target;
-                SDL_zero(scene_target);
-                scene_target.texture = renderer.msaa_color;
-                scene_target.mip_level = 0;
-                scene_target.layer_or_depth_plane = 0;
-                scene_target.load_op = SDL_GPU_LOADOP_CLEAR;
-                scene_target.store_op = SDL_GPU_STOREOP_RESOLVE;
-                scene_target.clear_color = SDL_FColor{0.2f, 0.3f, 0.3f, 1.0f};
-                scene_target.resolve_texture = swap_texture;
-                scene_target.resolve_mip_level = 0;
-                scene_target.resolve_layer = 0;
-
-                frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &scene_target, 1, NULL);
-
-                if (draw_func && draw_data)
-                    draw_func(draw_data);
-
-                SDL_EndGPURenderPass(frame.render_pass_ptr);
-
-                SDL_GPUColorTargetInfo imgui_target;
-                SDL_zero(imgui_target);
-                imgui_target.texture = swap_texture;
-                imgui_target.mip_level = 0;
-                imgui_target.layer_or_depth_plane = 0;
-                imgui_target.load_op = SDL_GPU_LOADOP_LOAD;
-                imgui_target.store_op = SDL_GPU_STOREOP_STORE;
-
-                frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &imgui_target, 1, NULL);
-
-                brender::imgui_submit(renderer.frame);
-
-                SDL_EndGPURenderPass(frame.render_pass_ptr);
-            }
-            else
-            {
-                SDL_GPUColorTargetInfo single_target;
-                SDL_zero(single_target);
-                single_target.texture = swap_texture;
-                single_target.mip_level = 0;
-                single_target.layer_or_depth_plane = 0;
-                single_target.load_op = SDL_GPU_LOADOP_CLEAR;
-                single_target.store_op = SDL_GPU_STOREOP_STORE;
-                single_target.clear_color = SDL_FColor{0.2f, 0.3f, 0.3f, 1.0f};
-
-                frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &single_target, 1, NULL);
-
-                if (draw_func && draw_data)
-                    draw_func(draw_data);
-
-                brender::imgui_submit(renderer.frame);
-
-                SDL_EndGPURenderPass(frame.render_pass_ptr);
-            }
-        }
-
-        SDL_SubmitGPUCommandBuffer(frame.command_buffer_ptr);
-
-        if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
-        {
-            ImGui::UpdatePlatformWindows();
-            ImGui::RenderPlatformWindowsDefault();
-        }
-
-        SDL_Delay(1);
     }
 
 }
@@ -636,7 +645,6 @@ namespace shader
         shader_manager.opts.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_2);
     }
 
-
 }
 
 struct draw_function_data {
@@ -648,7 +656,6 @@ struct draw_function_data {
 void draw_function(const void* data_ptr)
 {
     const auto& args = *static_cast<const draw_function_data*>(data_ptr);
-
     SDL_BindGPUGraphicsPipeline(args.frame.render_pass_ptr, shader::as_pipeline(args.program));
     SDL_GPUBufferBinding vertex_binding;
     vertex_binding.buffer = args.vbo;
@@ -725,6 +732,8 @@ int main(int argc, char* argv[])
             if (event.type == SDL_EVENT_QUIT) running = 0;
             if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) running = 0;
             if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) brender::create_target(renderer);
+            if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F1)
+                g_mode = (g_mode == SceneMode::Docked) ? SceneMode::Fullscreen : SceneMode::Docked;
         }
 
         for (shader::program& prog : shader_manager.programs)
@@ -745,6 +754,9 @@ int main(int argc, char* argv[])
     SDL_ReleaseGPUTransferBuffer(renderer.device_ptr, tbo);
     SDL_ReleaseGPUBuffer(renderer.device_ptr, vbo);
     if (renderer.msaa_color) SDL_ReleaseGPUTexture(renderer.device_ptr, renderer.msaa_color);
+    if (renderer.scene_msaa) SDL_ReleaseGPUTexture(renderer.device_ptr, renderer.scene_msaa);
+    if (renderer.scene_tex) SDL_ReleaseGPUTexture(renderer.device_ptr, renderer.scene_tex);
+    if (renderer.scene_sampler) SDL_ReleaseGPUSampler(renderer.device_ptr, renderer.scene_sampler);
 
     SDL_ReleaseWindowFromGPUDevice(renderer.device_ptr, renderer.window_ptr);
     SDL_DestroyWindow(renderer.window_ptr);
