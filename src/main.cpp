@@ -496,7 +496,8 @@ namespace shader
         out_program.pipeline.data = nullptr;
 
         ReflectedVertexInput vertex_input{};
-        if (!reflect_vertex_input(out_program.vertex.data->spirv, vertex_input)) DIE("reflect_vertex_input");
+        if (!reflect_vertex_input(out_program.vertex.data->spirv, vertex_input))
+            DIE("reflect_vertex_input");
         pack_tight(vertex_input);
 
         SDL_GPUSampleCount requested = map_samples(cfg.sample_count);
@@ -664,11 +665,43 @@ void draw_function(const void* data_ptr)
     SDL_DrawGPUPrimitives(args.frame.render_pass_ptr, 3, 1, 0, 0);
 }
 
+static SDL_HitTestResult SDLCALL window_hit_test(SDL_Window* win, const SDL_Point* pt, void* /*data*/)
+{
+    const int drag_bar_px = 30;
+    const int resize_px = 8;
+
+    int w = 0, h = 0;
+    SDL_GetWindowSize(win, &w, &h);
+
+    bool left = pt->x < resize_px;
+    bool right = pt->x >= w - resize_px;
+    bool top = pt->y < resize_px;
+    bool bottom = pt->y >= h - resize_px;
+
+    if (top && left) return SDL_HITTEST_RESIZE_TOPLEFT;
+    if (top && right) return SDL_HITTEST_RESIZE_TOPRIGHT;
+    if (bottom && left) return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+    if (bottom && right) return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+
+    if (top) return SDL_HITTEST_RESIZE_TOP;
+    if (bottom) return SDL_HITTEST_RESIZE_BOTTOM;
+    if (left) return SDL_HITTEST_RESIZE_LEFT;
+    if (right) return SDL_HITTEST_RESIZE_RIGHT;
+
+    if (pt->y < drag_bar_px) return SDL_HITTEST_DRAGGABLE;
+
+    return SDL_HITTEST_NORMAL;
+}
+
 int main(int argc, char* argv[])
 {
     brender::renderer renderer;
     brender::create_info create_info;
     brender::xinit(renderer, create_info);
+
+    const float aspect = 16.0f / 9.0f;
+    SDL_SetWindowAspectRatio(renderer.window_ptr, aspect, aspect);
+    SDL_SetWindowMinimumSize(renderer.window_ptr, 640, 360);
 
     float vertices[] =
     {
@@ -731,9 +764,24 @@ int main(int argc, char* argv[])
             ImGui_ImplSDL3_ProcessEvent(&event);
             if (event.type == SDL_EVENT_QUIT) running = 0;
             if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) running = 0;
-            if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) brender::create_target(renderer);
+            if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED)
+            {
+                brender::create_target(renderer);
+            }
             if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F1)
+            {
                 g_mode = (g_mode == SceneMode::Docked) ? SceneMode::Fullscreen : SceneMode::Docked;
+                if (g_mode == SceneMode::Fullscreen)
+                {
+                    SDL_SetWindowBordered(renderer.window_ptr, false);
+                    SDL_SetWindowHitTest(renderer.window_ptr, window_hit_test, nullptr);
+                }
+                else
+                {
+                    SDL_SetWindowBordered(renderer.window_ptr, true);
+                    SDL_SetWindowHitTest(renderer.window_ptr, nullptr, nullptr);
+                }
+            }
         }
 
         for (shader::program& prog : shader_manager.programs)
