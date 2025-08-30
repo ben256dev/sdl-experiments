@@ -13,15 +13,126 @@
 #include <memory>
 #include <thread>
 #include <chrono>
+#include <stdexcept>
 #include <shaderc/shaderc.hpp>
 #include "blake3.h"
 #include "shader.h"
 #include "shader_reflect.h"
 #include "pipeline_config.h"
 
+namespace logui
+{
+    enum class level { info, warn, error };
+
+    struct line
+    {
+        level lvl{};
+        std::string text;
+    };
+
+    struct ring
+    {
+        std::vector<line> data;
+        size_t head = 0;
+        size_t count = 0;
+
+        ring(size_t cap = 1024)
+        {
+            data.resize(cap);
+        }
+
+        size_t capacity() const
+        {
+            return data.size();
+        }
+
+        void clear()
+        {
+            head = 0;
+            count = 0;
+        }
+
+        void push(level lvl, std::string msg)
+        {
+            if (data.empty())
+                return;
+
+            size_t cap = capacity();
+            if (count < cap)
+            {
+                size_t idx = (head + count) % cap;
+                data[idx] = { lvl, std::move(msg) };
+                count++;
+                return;
+            }
+
+            data[head] = { lvl, std::move(msg) };
+            head = (head + 1) % cap;
+        }
+    };
+
+    static ImVec4 color(level lvl)
+    {
+        if (lvl == level::info)  return ImVec4(0.85f, 0.85f, 0.85f, 1.0f);
+        if (lvl == level::warn)  return ImVec4(0.95f, 0.80f, 0.35f, 1.0f);
+        return ImVec4(1.00f, 0.45f, 0.45f, 1.0f);
+    }
+
+    void draw(ring* buf, bool* open = nullptr)
+    {
+        if (!buf)
+            return;
+
+        if (!ImGui::Begin("Console", open))
+        {
+            ImGui::End();
+            return;
+        }
+
+        static bool autoscroll = true;
+        if (ImGui::Button("Clear")) buf->clear();
+        ImGui::SameLine();
+        ImGui::Checkbox("Auto-scroll", &autoscroll);
+        ImGui::Separator();
+
+        ImGuiListClipper clipper;
+        clipper.Begin((int)buf->count);
+        while (clipper.Step())
+        {
+            for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i)
+            {
+                size_t idx = (buf->head + (size_t)i) % buf->capacity();
+                const line& ln = buf->data[idx];
+                ImGui::PushStyleColor(ImGuiCol_Text, color(ln.lvl));
+                ImGui::TextUnformatted(ln.text.c_str());
+                ImGui::PopStyleColor();
+            }
+        }
+
+        if (autoscroll)
+            ImGui::SetScrollHereY(1.0f);
+
+        ImGui::End();
+    }
+}
+
 #ifndef SHADER_SRC_DIR
 #define SHADER_SRC_DIR "shaders"
 #endif
+
+static logui::ring* g_console_ptr = nullptr;
+
+static inline void app_log(logui::level lvl, const std::string& msg)
+{
+    if (g_console_ptr)
+        g_console_ptr->push(lvl, msg);
+    std::fprintf(stderr, "%s\n", msg.c_str());
+}
+
+struct soft_error : std::runtime_error
+{
+    using std::runtime_error::runtime_error;
+};
 
 static inline const char* sdl_basename(const char* program_path)
 {
@@ -47,9 +158,10 @@ static inline void sdl_die_at(const char* what, const char* file, int line)
 
 static inline void die_at(const char* what, const char* file, int line)
 {
-    std::fprintf(stderr, "\x1b[31mFATAL: %s (%s:%d)\x1b[0m\n",
-                 what ? what : "", file, line);
-    std::exit(EXIT_FAILURE);
+    char buf[1024];
+    std::snprintf(buf, sizeof(buf), "FATAL: %s (%s:%d)", what ? what : "", file, line);
+    app_log(logui::level::error, buf);
+    throw soft_error(buf);
 }
 
 #define DIE(what) die_at((what), sdl_basename(__FILE__), __LINE__)
@@ -60,30 +172,35 @@ static SceneMode g_mode = SceneMode::Docked;
 namespace brender
 {
 
-    struct window {
+    struct window
+    {
         const char* title = "brender";
         int width = 1280;
         int height = 720;
         Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     };
 
-    struct device {
+    struct device
+    {
         SDL_GPUShaderFormat format_flags = SDL_GPU_SHADERFORMAT_SPIRV;
         bool debug_mode = false;
         const char* name = NULL;
     };
 
-    struct create_info {
+    struct create_info
+    {
         brender::window window;
         brender::device device;
     };
 
-    struct frame {
+    struct frame
+    {
         SDL_GPURenderPass*    render_pass_ptr;
         SDL_GPUCommandBuffer* command_buffer_ptr;
     };
 
-    struct renderer {
+    struct renderer
+    {
         SDL_Window* window_ptr = nullptr;
         SDL_GPUDevice* device_ptr = nullptr;
         SDL_GPUTextureFormat swap_format = SDL_GPU_TEXTUREFORMAT_INVALID;
@@ -157,19 +274,13 @@ namespace brender
 
     using draw_func_ptr = void(*)(const void*);
 
-    static void create_scene_targets(brender::renderer& r, int w, int h) {
-        if (r.scene_msaa) SDL_ReleaseGPUTexture(r.device_ptr, r.scene_msaa);
+    static void create_scene_targets(brender::renderer& r, int w, int h)
+    {
         if (r.scene_tex)  SDL_ReleaseGPUTexture(r.device_ptr, r.scene_tex);
-        SDL_GPUTextureCreateInfo msaa{};
-        msaa.type = SDL_GPU_TEXTURETYPE_2D;
-        msaa.format = r.swap_format;
-        msaa.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
-        msaa.width = (Uint32)w;
-        msaa.height = (Uint32)h;
-        msaa.layer_count_or_depth = 1;
-        msaa.num_levels = 1;
-        msaa.sample_count = r.msaa;
-        r.scene_msaa = SDL_CreateGPUTexture(r.device_ptr, &msaa);
+        if (r.scene_msaa) SDL_ReleaseGPUTexture(r.device_ptr, r.scene_msaa);
+        r.scene_tex = nullptr;
+        r.scene_msaa = nullptr;
+
         SDL_GPUTextureCreateInfo single{};
         single.type = SDL_GPU_TEXTURETYPE_2D;
         single.format = r.swap_format;
@@ -180,7 +291,23 @@ namespace brender
         single.num_levels = 1;
         single.sample_count = SDL_GPU_SAMPLECOUNT_1;
         r.scene_tex = SDL_CreateGPUTexture(r.device_ptr, &single);
-        if (!r.scene_sampler) {
+
+        if (r.msaa > SDL_GPU_SAMPLECOUNT_1)
+        {
+            SDL_GPUTextureCreateInfo msaa{};
+            msaa.type = SDL_GPU_TEXTURETYPE_2D;
+            msaa.format = r.swap_format;
+            msaa.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
+            msaa.width = (Uint32)w;
+            msaa.height = (Uint32)h;
+            msaa.layer_count_or_depth = 1;
+            msaa.num_levels = 1;
+            msaa.sample_count = r.msaa;
+            r.scene_msaa = SDL_CreateGPUTexture(r.device_ptr, &msaa);
+        }
+
+        if (!r.scene_sampler)
+        {
             SDL_GPUSamplerCreateInfo sci{};
             r.scene_sampler = SDL_CreateGPUSampler(r.device_ptr, &sci);
         }
@@ -190,7 +317,8 @@ namespace brender
         r.scene_h = h;
     }
 
-    static void imgui_scene_window(brender::renderer& r) {
+    static void imgui_scene_window(brender::renderer& r)
+    {
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
         ImGui::Begin("Scene");
         ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -200,7 +328,8 @@ namespace brender
         if (w != r.scene_w || h != r.scene_h) create_scene_targets(r, w, h);
         if (!r.scene_tex) create_scene_targets(r, w, h);
         ImGuiPlatformIO& pio = ImGui::GetPlatformIO();
-        if (pio.Renderer_RenderState && r.scene_sampler) {
+        if (pio.Renderer_RenderState && r.scene_sampler)
+        {
             auto* rs = (ImGui_ImplSDLGPU3_RenderState*)pio.Renderer_RenderState;
             rs->SamplerCurrent = r.scene_sampler;
         }
@@ -209,14 +338,16 @@ namespace brender
         ImGui::PopStyleVar();
     }
 
-    void draw(brender::renderer& renderer, brender::draw_func_ptr draw_func, const void* draw_data)
+    void draw(brender::renderer& renderer, brender::draw_func_ptr draw_func, logui::ring& console, const void* draw_data)
     {
-        if (g_mode == SceneMode::Docked) {
+        if (g_mode == SceneMode::Docked)
+        {
             ImGui_ImplSDL3_NewFrame();
             ImGui_ImplSDLGPU3_NewFrame();
             ImGui::NewFrame();
             ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
             imgui_scene_window(renderer);
+            logui::draw(&console);
             ImGui::Render();
         }
 
@@ -226,49 +357,70 @@ namespace brender
         SDL_GPUTexture* swap_texture = NULL;
         Uint32 swap_w = 0, swap_h = 0;
         bool ok = SDL_AcquireGPUSwapchainTexture(frame.command_buffer_ptr, renderer.window_ptr, &swap_texture, &swap_w, &swap_h);
-        if (!ok || !swap_texture) {
+        if (!ok || !swap_texture)
+        {
             SDL_SubmitGPUCommandBuffer(frame.command_buffer_ptr);
             SDL_Delay(1);
             return;
         }
 
-        if (g_mode == SceneMode::Docked) {
-            SDL_GPUColorTargetInfo scene_t{};
-            scene_t.texture = renderer.scene_msaa;
-            scene_t.load_op = SDL_GPU_LOADOP_CLEAR;
-            scene_t.store_op = SDL_GPU_STOREOP_RESOLVE;
-            scene_t.clear_color = SDL_FColor{0.2f,0.3f,0.3f,1.0f};
-            scene_t.resolve_texture = renderer.scene_tex;
-            frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &scene_t, 1, NULL);
-            if (draw_func && draw_data) draw_func(draw_data);
-            SDL_EndGPURenderPass(frame.render_pass_ptr);
+        if (g_mode == SceneMode::Docked)
+        {
+            if (renderer.msaa > SDL_GPU_SAMPLECOUNT_1)
+            {
+                SDL_GPUColorTargetInfo t{};
+                t.texture = renderer.scene_msaa;
+                t.load_op = SDL_GPU_LOADOP_CLEAR;
+                t.store_op = SDL_GPU_STOREOP_RESOLVE;
+                t.clear_color = SDL_FColor{0.2f, 0.3f, 0.3f, 1.0f};
+                t.resolve_texture = renderer.scene_tex;
+                frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &t, 1, NULL);
+                if (draw_func && draw_data) draw_func(draw_data);
+                SDL_EndGPURenderPass(frame.render_pass_ptr);
+            }
+            else
+            {
+                SDL_GPUColorTargetInfo t{};
+                t.texture = renderer.scene_tex;
+                t.load_op = SDL_GPU_LOADOP_CLEAR;
+                t.store_op = SDL_GPU_STOREOP_STORE;
+                t.clear_color = SDL_FColor{0.2f, 0.3f, 0.3f, 1.0f};
+                frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &t, 1, NULL);
+                if (draw_func && draw_data) draw_func(draw_data);
+                SDL_EndGPURenderPass(frame.render_pass_ptr);
+            }
 
-            SDL_GPUColorTargetInfo ui_t{};
-            ui_t.texture = swap_texture;
-            ui_t.load_op = SDL_GPU_LOADOP_CLEAR;
-            ui_t.store_op = SDL_GPU_STOREOP_STORE;
-            ui_t.clear_color = SDL_FColor{0.1f,0.1f,0.1f,1.0f};
-            frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &ui_t, 1, NULL);
+            SDL_GPUColorTargetInfo ui{};
+            ui.texture = swap_texture;
+            ui.load_op = SDL_GPU_LOADOP_CLEAR;
+            ui.store_op = SDL_GPU_STOREOP_STORE;
+            ui.clear_color = SDL_FColor{0.1f, 0.1f, 0.1f, 1.0f};
+            frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &ui, 1, NULL);
             ImGui_ImplSDLGPU3_PrepareDrawData(ImGui::GetDrawData(), frame.command_buffer_ptr);
             ImGui_ImplSDLGPU3_RenderDrawData(ImGui::GetDrawData(), frame.command_buffer_ptr, frame.render_pass_ptr, NULL);
             SDL_EndGPURenderPass(frame.render_pass_ptr);
-        } else {
-            if (renderer.msaa > SDL_GPU_SAMPLECOUNT_1) {
-                SDL_GPUColorTargetInfo scene_t{};
-                scene_t.texture = renderer.msaa_color;
-                scene_t.load_op = SDL_GPU_LOADOP_CLEAR;
-                scene_t.store_op = SDL_GPU_STOREOP_RESOLVE;
-                scene_t.clear_color = SDL_FColor{0.2f,0.3f,0.3f,1.0f};
-                scene_t.resolve_texture = swap_texture;
-                frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &scene_t, 1, NULL);
+        }
+        else
+        {
+            if (renderer.msaa > SDL_GPU_SAMPLECOUNT_1)
+            {
+                SDL_GPUColorTargetInfo t{};
+                t.texture = renderer.msaa_color;
+                t.load_op = SDL_GPU_LOADOP_CLEAR;
+                t.store_op = SDL_GPU_STOREOP_RESOLVE;
+                t.clear_color = SDL_FColor{0.2f, 0.3f, 0.3f, 1.0f};
+                t.resolve_texture = swap_texture;
+                frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &t, 1, NULL);
                 if (draw_func && draw_data) draw_func(draw_data);
                 SDL_EndGPURenderPass(frame.render_pass_ptr);
-            } else {
+            }
+            else
+            {
                 SDL_GPUColorTargetInfo t{};
                 t.texture = swap_texture;
                 t.load_op = SDL_GPU_LOADOP_CLEAR;
                 t.store_op = SDL_GPU_STOREOP_STORE;
-                t.clear_color = SDL_FColor{0.2f,0.3f,0.3f,1.0f};
+                t.clear_color = SDL_FColor{0.2f, 0.3f, 0.3f, 1.0f};
                 frame.render_pass_ptr = SDL_BeginGPURenderPass(frame.command_buffer_ptr, &t, 1, NULL);
                 if (draw_func && draw_data) draw_func(draw_data);
                 SDL_EndGPURenderPass(frame.render_pass_ptr);
@@ -316,32 +468,40 @@ namespace shader
 
     enum class type { vertex, fragment, pipeline };
 
-    struct file {
+    struct file
+    {
         type shader_type{};
         std::string name;
         std::string path;
         std::string source;
         std::array<uint8_t, BLAKE3_OUT_LEN> dgst{};
+
+        std::array<uint8_t, BLAKE3_OUT_LEN> failed_dgst{};
+        bool failed_valid = false;
     };
 
-    struct spirv_info {
+    struct spirv_info
+    {
         std::vector<uint32_t> spirv;
         ReflectedResources reflect{};
     };
 
-    struct source {
+    struct source
+    {
         shader::file file;
         spirv_info* data{};
         void* sdl_ptr{};
     };
 
-    struct program {
+    struct program
+    {
         source vertex;
         source fragment;
         source pipeline;
     };
 
-    struct manager {
+    struct manager
+    {
         shaderc::Compiler compiler;
         shaderc::CompileOptions opts;
         std::vector<file> files;
@@ -458,19 +618,11 @@ namespace shader
         program_ref.fragment.data = nullptr;
     }
 
-    program& build_program(brender::renderer& renderer, manager& shader_manager, const char* pipeline_json_name, program* reuse_program = nullptr)
+    static program build_program_internal(brender::renderer& renderer, manager& shader_manager, const char* pipeline_json_name)
     {
-        program* program_ptr = reuse_program ? reuse_program : &shader_manager.programs.emplace_back();
-        std::string pipeline_name_copy = pipeline_json_name;
-        if (reuse_program)
-        {
-            destroy_program(renderer, *program_ptr);
-            *program_ptr = program{};
-        }
+        program out_program{};
 
-        program& out_program = *program_ptr;
-
-        load_text_file(out_program.pipeline.file, type::pipeline, pipeline_name_copy.c_str());
+        load_text_file(out_program.pipeline.file, type::pipeline, pipeline_json_name);
 
         PipelineConfig cfg{};
         if (!load_pipeline_config(out_program.pipeline.file.path, cfg, 1))
@@ -502,8 +654,11 @@ namespace shader
 
         SDL_GPUSampleCount requested = map_samples(cfg.sample_count);
         SDL_GPUSampleCount chosen = choose_supported(renderer.device_ptr, renderer.swap_format, requested);
-        shader::g_log.emplace_back("MSAA requested=" + std::to_string((int)requested) +
-                           " chosen=" + std::to_string((int)chosen));
+        {
+            char msg[128];
+            std::snprintf(msg, sizeof(msg), "MSAA requested=%d chosen=%d", (int)requested, (int)chosen);
+            app_log(logui::level::info, msg);
+        }
 
         if (renderer.msaa != chosen)
         {
@@ -535,11 +690,11 @@ namespace shader
 
         SDL_GPUShader* vertex_shader_ptr = SDL_CreateGPUShader(renderer.device_ptr, &vci);
         if (!vertex_shader_ptr)
-            SDIE("SDL_CreateGPUShader(vertex)");
+            DIE("SDL_CreateGPUShader(vertex) failed");
 
         SDL_GPUShader* fragment_shader_ptr = SDL_CreateGPUShader(renderer.device_ptr, &fci);
         if (!fragment_shader_ptr)
-            SDIE("SDL_CreateGPUShader(fragment)");
+            DIE("SDL_CreateGPUShader(fragment) failed");
 
         out_program.vertex.sdl_ptr   = vertex_shader_ptr;
         out_program.fragment.sdl_ptr = fragment_shader_ptr;
@@ -621,22 +776,216 @@ namespace shader
 
         SDL_GPUGraphicsPipeline* pipeline_ptr = SDL_CreateGPUGraphicsPipeline(renderer.device_ptr, &pipeline_info);
         if (!pipeline_ptr)
-            SDIE("SDL_CreateGPUGraphicsPipeline");
+            DIE("SDL_CreateGPUGraphicsPipeline failed");
 
         out_program.pipeline.sdl_ptr = pipeline_ptr;
         return out_program;
     }
 
-    static bool has_changed(const file& current)
+    program& build_program(brender::renderer& renderer, manager& shader_manager, const char* pipeline_json_name, program* reuse_program = nullptr)
     {
-        std::string text1, text2;
-        if (!read_file_retry(current.path, text1)) return false;
-        std::this_thread::sleep_for(std::chrono::milliseconds(8));
-        if (!read_file_retry(current.path, text2)) return false;
-        if (text1 != text2) return false;
-        std::array<uint8_t, BLAKE3_OUT_LEN> dgst{};
-        blake3_digest(text1, dgst);
-        return dgst != current.dgst;
+        program* dst = reuse_program ? reuse_program : &shader_manager.programs.emplace_back();
+
+        try
+        {
+            load_text_file(dst->pipeline.file, type::pipeline, pipeline_json_name);
+
+            PipelineConfig cfg{};
+            if (!load_pipeline_config(dst->pipeline.file.path, cfg, 1))
+                DIE(("Failed to load pipeline config: " + dst->pipeline.file.path).c_str());
+
+            load_text_file(dst->vertex.file,   type::vertex,   cfg.vertex_shader.c_str());
+            load_text_file(dst->fragment.file, type::fragment, cfg.fragment_shader.c_str());
+
+            std::string opt_global = cfg.shaderc_optimization;
+            std::string opt_vs = cfg.shaderc_optimization_vs.size() ? cfg.shaderc_optimization_vs : opt_global;
+            std::string opt_fs = cfg.shaderc_optimization_fs.size() ? cfg.shaderc_optimization_fs : opt_global;
+            if (opt_vs.empty()) opt_vs = "performance";
+            if (opt_fs.empty()) opt_fs = "performance";
+
+            shader_manager.opts.SetOptimizationLevel(map_opt_level(opt_vs));
+            std::unique_ptr<spirv_info> vs_info = compile_to_spirv(shader_manager, dst->vertex.file,   shaderc_vertex_shader);
+
+            shader_manager.opts.SetOptimizationLevel(map_opt_level(opt_fs));
+            std::unique_ptr<spirv_info> fs_info = compile_to_spirv(shader_manager, dst->fragment.file, shaderc_fragment_shader);
+
+            ReflectedVertexInput vertex_input{};
+            if (!reflect_vertex_input(vs_info->spirv, vertex_input)) DIE("reflect_vertex_input");
+            pack_tight(vertex_input);
+
+            SDL_GPUSampleCount requested = map_samples(cfg.sample_count);
+            SDL_GPUSampleCount chosen = choose_supported(renderer.device_ptr, renderer.swap_format, requested);
+            if (renderer.msaa != chosen)
+            {
+                renderer.msaa = chosen;
+                brender::create_target(renderer);
+
+                int w = renderer.scene_w;
+                int h = renderer.scene_h;
+                if (w <= 0 || h <= 0)
+                {
+                    int pxw = 0, pxh = 0;
+                    SDL_GetWindowSizeInPixels(renderer.window_ptr, &pxw, &pxh);
+                    w = pxw;
+                    h = pxh;
+                }
+                brender::create_scene_targets(renderer, w, h);
+            }
+
+            SDL_GPUShaderCreateInfo vci{};
+            vci.code_size = vs_info->spirv.size() * sizeof(uint32_t);
+            vci.code = reinterpret_cast<const Uint8*>(vs_info->spirv.data());
+            vci.entrypoint = cfg.entry_vs.empty() ? "main" : cfg.entry_vs.c_str();
+            vci.format = SDL_GPU_SHADERFORMAT_SPIRV;
+            vci.stage  = SDL_GPU_SHADERSTAGE_VERTEX;
+            vci.num_samplers         = vs_info->reflect.num_samplers;
+            vci.num_storage_textures = vs_info->reflect.num_storage_textures;
+            vci.num_storage_buffers  = vs_info->reflect.num_storage_buffers;
+            vci.num_uniform_buffers  = vs_info->reflect.num_uniform_buffers;
+
+            SDL_GPUShaderCreateInfo fci{};
+            fci.code_size = fs_info->spirv.size() * sizeof(uint32_t);
+            fci.code = reinterpret_cast<const Uint8*>(fs_info->spirv.data());
+            fci.entrypoint = cfg.entry_fs.empty() ? "main" : cfg.entry_fs.c_str();
+            fci.format = SDL_GPU_SHADERFORMAT_SPIRV;
+            fci.stage  = SDL_GPU_SHADERSTAGE_FRAGMENT;
+            fci.num_samplers         = fs_info->reflect.num_samplers;
+            fci.num_storage_textures = fs_info->reflect.num_storage_textures;
+            fci.num_storage_buffers  = fs_info->reflect.num_storage_buffers;
+            fci.num_uniform_buffers  = fs_info->reflect.num_uniform_buffers;
+
+            SDL_GPUShader* new_vs = SDL_CreateGPUShader(renderer.device_ptr, &vci);
+            if (!new_vs) DIE("SDL_CreateGPUShader(vertex)");
+
+            SDL_GPUShader* new_fs = SDL_CreateGPUShader(renderer.device_ptr, &fci);
+            if (!new_fs) { SDL_ReleaseGPUShader(renderer.device_ptr, new_vs); DIE("SDL_CreateGPUShader(fragment)"); }
+
+            SDL_GPUVertexInputState vertex_input_state{};
+            vertex_input_state.vertex_buffer_descriptions = &vertex_input.buffer_desc;
+            vertex_input_state.num_vertex_buffers = 1;
+            vertex_input_state.vertex_attributes = vertex_input.attributes.data();
+            vertex_input_state.num_vertex_attributes = (Uint32)vertex_input.attributes.size();
+
+            SDL_GPURasterizerState rasterizer_state{};
+            rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+            rasterizer_state.cull_mode = cfg.cull;
+            rasterizer_state.front_face= cfg.front_face;
+            rasterizer_state.enable_depth_bias = false;
+            rasterizer_state.enable_depth_clip = true;
+
+            SDL_GPUMultisampleState multisample_state{};
+            multisample_state.sample_count = renderer.msaa;
+            multisample_state.sample_mask = 0;
+            multisample_state.enable_mask = false;
+
+            SDL_GPUDepthStencilState depth_stencil_state{};
+            depth_stencil_state.enable_depth_test = cfg.depth.enable;
+            depth_stencil_state.enable_depth_write= cfg.depth.write;
+            depth_stencil_state.enable_stencil_test=false;
+            depth_stencil_state.compare_op = cfg.depth.compare;
+            depth_stencil_state.compare_mask = 0xFF;
+            depth_stencil_state.write_mask = 0xFF;
+
+            std::vector<SDL_GPUColorTargetDescription> color_targets;
+            color_targets.resize(cfg.blends.empty() ? 1 : cfg.blends.size());
+            for (size_t i = 0; i < color_targets.size(); ++i)
+            {
+                SDL_GPUColorTargetBlendState b{};
+                if (!cfg.blends.empty())
+                {
+                    b.enable_blend = cfg.blends[i].enable;
+                    b.enable_color_write_mask = true;
+                    b.color_write_mask = cfg.blends[i].write_mask;
+                    b.src_color_blendfactor = cfg.blends[i].src_color;
+                    b.dst_color_blendfactor = cfg.blends[i].dst_color;
+                    b.color_blend_op = cfg.blends[i].color_op;
+                    b.src_alpha_blendfactor = cfg.blends[i].src_alpha;
+                    b.dst_alpha_blendfactor = cfg.blends[i].dst_alpha;
+                    b.alpha_blend_op = cfg.blends[i].alpha_op;
+                }
+                else
+                {
+                    b.enable_blend = false;
+                    b.enable_color_write_mask = true;
+                    b.color_write_mask = SDL_GPU_COLORCOMPONENT_R | SDL_GPU_COLORCOMPONENT_G | SDL_GPU_COLORCOMPONENT_B | SDL_GPU_COLORCOMPONENT_A;
+                    b.src_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+                    b.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ZERO;
+                    b.color_blend_op = SDL_GPU_BLENDOP_ADD;
+                    b.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+                    b.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ZERO;
+                    b.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+                }
+                color_targets[i].format = renderer.swap_format;
+                color_targets[i].blend_state = b;
+            }
+
+            SDL_GPUGraphicsPipelineTargetInfo target_info{};
+            target_info.color_target_descriptions = color_targets.data();
+            target_info.num_color_targets = (Uint32)color_targets.size();
+            target_info.depth_stencil_format = cfg.depth.enable ? cfg.depth.format : SDL_GPU_TEXTUREFORMAT_INVALID;
+            target_info.has_depth_stencil_target = cfg.depth.enable;
+
+            SDL_GPUGraphicsPipelineCreateInfo pipeline_info{};
+            pipeline_info.vertex_shader       = new_vs;
+            pipeline_info.fragment_shader     = new_fs;
+            pipeline_info.vertex_input_state  = vertex_input_state;
+            pipeline_info.primitive_type      = cfg.primitive;
+            pipeline_info.rasterizer_state    = rasterizer_state;
+            pipeline_info.multisample_state   = multisample_state;
+            pipeline_info.depth_stencil_state = depth_stencil_state;
+            pipeline_info.target_info         = target_info;
+
+            SDL_GPUGraphicsPipeline* new_pipe = SDL_CreateGPUGraphicsPipeline(renderer.device_ptr, &pipeline_info);
+            if (!new_pipe)
+            {
+                SDL_ReleaseGPUShader(renderer.device_ptr, new_vs);
+                SDL_ReleaseGPUShader(renderer.device_ptr, new_fs);
+                DIE("SDL_CreateGPUGraphicsPipeline");
+            }
+
+            if (dst->pipeline.sdl_ptr) SDL_ReleaseGPUGraphicsPipeline(renderer.device_ptr, (SDL_GPUGraphicsPipeline*)dst->pipeline.sdl_ptr);
+            if (dst->vertex.sdl_ptr)   SDL_ReleaseGPUShader(renderer.device_ptr, (SDL_GPUShader*)dst->vertex.sdl_ptr);
+            if (dst->fragment.sdl_ptr) SDL_ReleaseGPUShader(renderer.device_ptr, (SDL_GPUShader*)dst->fragment.sdl_ptr);
+
+            delete dst->vertex.data;
+            delete dst->fragment.data;
+
+            dst->vertex.data = vs_info.release();
+            dst->fragment.data = fs_info.release();
+
+            dst->vertex.sdl_ptr = new_vs;
+            dst->fragment.sdl_ptr = new_fs;
+            dst->pipeline.sdl_ptr = new_pipe;
+
+            dst->vertex.file.failed_valid = false;
+            dst->fragment.file.failed_valid = false;
+            dst->pipeline.file.failed_valid = false;
+
+            return *dst;
+        }
+        catch (const soft_error& e)
+        {
+            app_log(logui::level::error, std::string("Build failed: ") + e.what());
+            dst->vertex.file.failed_dgst = dst->vertex.file.dgst;
+            dst->fragment.file.failed_dgst = dst->fragment.file.dgst;
+            dst->pipeline.file.failed_dgst = dst->pipeline.file.dgst;
+            dst->vertex.file.failed_valid = true;
+            dst->fragment.file.failed_valid = true;
+            dst->pipeline.file.failed_valid = true;
+            return *dst;
+        }
+    }
+
+
+    static bool should_rebuild(const file& current)
+    {
+        std::string text;
+        if (!read_file_retry(current.path, text)) return false;
+        std::array<uint8_t, BLAKE3_OUT_LEN> now{};
+        blake3_digest(text, now);
+        if (now == current.dgst) return false;
+        if (current.failed_valid && now == current.failed_dgst) return false;
+        return true;
     }
 
     void init(manager& shader_manager)
@@ -647,7 +996,8 @@ namespace shader
 
 }
 
-struct draw_function_data {
+struct draw_function_data
+{
     brender::frame& frame;
     shader::program& program;
     SDL_GPUBuffer* vbo;
@@ -656,7 +1006,10 @@ struct draw_function_data {
 void draw_function(const void* data_ptr)
 {
     const auto& args = *static_cast<const draw_function_data*>(data_ptr);
-    SDL_BindGPUGraphicsPipeline(args.frame.render_pass_ptr, shader::as_pipeline(args.program));
+    SDL_GPUGraphicsPipeline* pipe = shader::as_pipeline(args.program);
+    if (!pipe)
+        return;
+    SDL_BindGPUGraphicsPipeline(args.frame.render_pass_ptr, pipe);
     SDL_GPUBufferBinding vertex_binding;
     vertex_binding.buffer = args.vbo;
     vertex_binding.offset = 0;
@@ -698,8 +1051,6 @@ int main(int argc, char* argv[])
     brender::create_info create_info;
     brender::xinit(renderer, create_info);
 
-    const float aspect = 16.0f / 9.0f;
-    SDL_SetWindowAspectRatio(renderer.window_ptr, aspect, aspect);
     SDL_SetWindowMinimumSize(renderer.window_ptr, 640, 360);
 
     float vertices[] =
@@ -748,11 +1099,16 @@ int main(int argc, char* argv[])
     vertex_binding.buffer = vbo;
     vertex_binding.offset = 0;
 
+    static logui::ring console(2048);
+    g_console_ptr = &console;
+
     shader::manager shader_manager;
     shader::init(shader_manager);
-    shader::program& triangle_program = shader::build_program(renderer, shader_manager, "triangle.pipeline.json");
 
-    draw_function_data draw_data{ renderer.frame, triangle_program, vbo };
+    shader::program& triangle_program = shader_manager.programs.emplace_back();
+    shader::build_program(renderer, shader_manager, "triangle.pipeline.json", &triangle_program);
+
+    struct draw_data_pack { brender::frame& frame; shader::program& program; SDL_GPUBuffer* vbo; } draw_data{ renderer.frame, triangle_program, vbo };
 
     int running = 1;
     while (running)
@@ -764,19 +1120,20 @@ int main(int argc, char* argv[])
             if (event.type == SDL_EVENT_QUIT) running = 0;
             if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) running = 0;
             if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED)
-            {
                 brender::create_target(renderer);
-            }
             if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F1)
             {
                 g_mode = (g_mode == SceneMode::Docked) ? SceneMode::Fullscreen : SceneMode::Docked;
                 if (g_mode == SceneMode::Fullscreen)
                 {
+                    const float aspect = 16.0f / 9.0f;
+                    SDL_SetWindowAspectRatio(renderer.window_ptr, aspect, aspect);
                     SDL_SetWindowBordered(renderer.window_ptr, false);
                     SDL_SetWindowHitTest(renderer.window_ptr, window_hit_test, nullptr);
                 }
                 else
                 {
+                    SDL_SetWindowAspectRatio(renderer.window_ptr, 0.0f, 0.0f);
                     SDL_SetWindowBordered(renderer.window_ptr, true);
                     SDL_SetWindowHitTest(renderer.window_ptr, nullptr, nullptr);
                 }
@@ -785,13 +1142,14 @@ int main(int argc, char* argv[])
 
         for (shader::program& prog : shader_manager.programs)
         {
-            bool pipeline_changed = shader::has_changed(prog.pipeline.file);
-            bool vertex_changed   = shader::has_changed(prog.vertex.file);
-            bool fragment_changed = shader::has_changed(prog.fragment.file);
+            bool pipeline_changed = shader::should_rebuild(prog.pipeline.file);
+            bool vertex_changed   = shader::should_rebuild(prog.vertex.file);
+            bool fragment_changed = shader::should_rebuild(prog.fragment.file);
             if (pipeline_changed || vertex_changed || fragment_changed)
                 shader::build_program(renderer, shader_manager, prog.pipeline.file.name.c_str(), &prog);
         }
-        brender::draw(renderer, &draw_function, &draw_data);
+
+        brender::draw(renderer, &draw_function, console, &draw_data);
     }
 
     brender::imgui_backend_shutdown();
